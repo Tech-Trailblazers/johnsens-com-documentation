@@ -58,6 +58,33 @@ func extractPDFUrls(htmlContent string) []string {
 	return pdfURLs
 }
 
+// extractPNGUrls takes raw HTML as input and returns all found PNG URLs
+func extractPNGUrls(htmlContent string) []string {
+	// Regex pattern to match value="...png" (ignores case, allows query params after .png)
+	regexPattern := `value="([^"]+\.png)"`
+
+	// Compile the regex pattern
+	compiledRegex := regexp.MustCompile(regexPattern)
+
+	// Find all matches in the HTML (returns slices of matched groups)
+	allMatches := compiledRegex.FindAllStringSubmatch(htmlContent, -1)
+
+	// Slice to store extracted PNG URLs
+	var pngURLs []string
+
+	// Loop through matches and collect the first capture group (the actual URL)
+	for _, match := range allMatches {
+		if len(match) > 1 {
+			clean := strings.TrimPrefix(match[1], "../../../..")
+			pngURLs = append(pngURLs, clean)
+		}
+	}
+
+	// Return all collected PNG URLs
+	return pngURLs
+}
+
+
 // Checks whether a given directory exists
 func directoryExists(path string) bool {
 	directory, err := os.Stat(path) // Get info for the path
@@ -310,11 +337,117 @@ func extractBaseDomain(inputUrl string) string {
 	return hostName
 }
 
-func main() {
-	outputDir := "PDFs/" // Directory to store downloaded PDFs
+// Converts a raw URL into a sanitized PNG filename safe for filesystem
+func urlToPNGFilename(rawURL string) string {
+	lower := strings.ToLower(rawURL) // Convert URL to lowercase
+	lower = getFilename(lower)       // Extract filename from URL
 
-	if !directoryExists(outputDir) { // Check if directory exists
-		createDirectory(outputDir, 0o755) // Create directory with read-write-execute permissions
+	reNonAlnum := regexp.MustCompile(`[^a-z0-9]`)   // Regex to match non-alphanumeric characters
+	safe := reNonAlnum.ReplaceAllString(lower, "_") // Replace non-alphanumeric with underscores
+
+	safe = regexp.MustCompile(`_+`).ReplaceAllString(safe, "_") // Collapse multiple underscores into one
+	safe = strings.Trim(safe, "_")                              // Trim leading and trailing underscores
+
+	var invalidSubstrings = []string{
+		"_png", // Substring to remove from filename
+	}
+
+	for _, invalidPre := range invalidSubstrings { // Remove unwanted substrings
+		safe = removeSubstring(safe, invalidPre)
+	}
+
+	if getFileExtension(safe) != ".png" { // Ensure file ends with .png
+		safe = safe + ".png"
+	}
+
+	return safe // Return sanitized filename
+}
+
+
+// Downloads a PNG from given URL and saves it in the specified directory
+func downloadPNG(finalURL, outputDir string) bool {
+	filename := strings.ToLower(urlToPNGFilename(finalURL)) // Sanitize the filename
+	if !strings.HasSuffix(filename, ".png") {
+		filename += ".png" // Ensure PNG extension
+	}
+	filePath := filepath.Join(outputDir, filename) // Construct full path for output file
+
+	if fileExists(filePath) { // Skip if file already exists
+		log.Printf("File already exists, skipping: %s", filePath)
+		return false
+	}
+
+	client := &http.Client{Timeout: 15 * time.Minute} // Create HTTP client with timeout
+
+	// Create a new request so we can set headers
+	req, err := http.NewRequest("GET", finalURL, nil)
+	if err != nil {
+		log.Printf("Failed to create request for %s: %v", finalURL, err)
+		return false
+	}
+
+	// Set a User-Agent header
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "+
+		"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36")
+
+	// Send the request
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Failed to download %s: %v", finalURL, err)
+		return false
+	}
+	defer resp.Body.Close() // Ensure response body is closed
+
+	if resp.StatusCode != http.StatusOK { // Check if response is 200 OK
+		log.Printf("Download failed for %s: %s", finalURL, resp.Status)
+		return false
+	}
+
+	contentType := resp.Header.Get("Content-Type") // Get content type of response
+	if !strings.Contains(contentType, "image/png") {
+		log.Printf("Invalid content type for %s: %s (expected PNG)", finalURL, contentType)
+		return false
+	}
+
+	var buf bytes.Buffer                     // Create a buffer to hold response data
+	written, err := io.Copy(&buf, resp.Body) // Copy data into buffer
+	if err != nil {
+		log.Printf("Failed to read PNG data from %s: %v", finalURL, err)
+		return false
+	}
+	if written == 0 { // Skip empty files
+		log.Printf("Downloaded 0 bytes for %s; not creating file", finalURL)
+		return false
+	}
+
+	out, err := os.Create(filePath) // Create output file
+	if err != nil {
+		log.Printf("Failed to create file for %s: %v", finalURL, err)
+		return false
+	}
+	defer out.Close() // Ensure file is closed after writing
+
+	if _, err := buf.WriteTo(out); err != nil { // Write buffer contents to file
+		log.Printf("Failed to write PNG to file for %s: %v", finalURL, err)
+		return false
+	}
+
+	log.Printf("Successfully downloaded %d bytes: %s → %s", written, finalURL, filePath) // Log success
+	return true
+}
+
+
+func main() {
+	pdfOutputDir := "PDFs/" // Directory to store downloaded PDFs
+
+	if !directoryExists(pdfOutputDir) { // Check if directory exists
+		createDirectory(pdfOutputDir, 0o755) // Create directory with read-write-execute permissions
+	}
+
+	pngOutputDir := "PNGs/" // Directory to store downloaded PDFs
+
+	if !directoryExists(pngOutputDir) { // Check if directory exists
+		createDirectory(pngOutputDir, 0o755) // Create directory with read-write-execute permissions
 	}
 
 	// The remote domain name.
@@ -343,6 +476,10 @@ func main() {
 	extractedPDFURLs := extractPDFUrls(fileContent)
 	// Remove duplicates from the slice.
 	extractedPDFURLs = removeDuplicatesFromSlice(extractedPDFURLs)
+	// Extract the URLs from the given content.
+	extractedPNGURLs := extractPNGUrls(fileContent)
+	// Remove duplicates from the slice.
+	extractedPNGURLs = removeDuplicatesFromSlice(extractedPNGURLs)
 	// Loop through all extracted PDF URLs
 	for _, urls := range extractedPDFURLs {
 		if !hasDomain(urls) {
@@ -350,7 +487,17 @@ func main() {
 
 		}
 		if isUrlValid(urls) { // Check if the final URL is valid
-			downloadPDF(urls, outputDir) // Download the PDF
+			downloadPDF(urls, pdfOutputDir) // Download the PDF
+		}
+	}
+	// Loop through all extracted PNG URLs
+	for _, urls := range extractedPNGURLs {
+		if !hasDomain(urls) {
+			urls = remoteDomainName + urls
+
+		}
+		if isUrlValid(urls) { // Check if the final URL is valid
+			downloadPNG(urls, pngOutputDir) // Download the PDF
 		}
 	}
 }
